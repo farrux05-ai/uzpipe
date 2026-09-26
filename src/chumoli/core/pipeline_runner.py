@@ -1057,22 +1057,28 @@ def drop_resource(name: str, resource: str, store: ControlStore | None = None) -
         return blocked
     pipeline = build_dlt_pipeline(stored.config)
     try:
+        # NOTE: `--pipelines-dir` is an option of the `pipeline` subcommand and
+        # MUST come before the pipeline name; `-y` is a global flag that skips
+        # the interactive "About to drop…" confirmation (otherwise the server
+        # would hang waiting on stdin).
         cmd = [
             sys.executable,
             "-m",
             "dlt",
+            "-y",
             "pipeline",
+            "--pipelines-dir",
+            str(pipeline.pipelines_dir),
             name,
             "drop",
             res,
-            "--pipelines-dir",
-            str(pipeline.pipelines_dir),
         ]
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=60,
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()[:400]

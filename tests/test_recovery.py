@@ -228,3 +228,25 @@ def test_drop_resource_empty_name_rejected(tmp_path) -> None:
     out = pr.drop_resource("rec_empty", "   ", store=store)
     assert out["status"] == "error"
     assert "bo'sh" in out["detail"]
+
+
+def test_drop_resource_actually_drops(tmp_path) -> None:
+    """Regression: drop_resource must build a valid dlt CLI invocation.
+
+    The old command put ``--pipelines-dir`` *after* the subcommand, so dlt
+    rejected it with "unrecognized arguments" and every drop silently failed.
+    """
+    register_builtin_connectors()
+    cipher = CredentialCipher(key_path=tmp_path / "k")
+    store = ControlStore(db_path=tmp_path / "c.db", cipher=cipher)
+    _save_simple(store, "rec_drop_real", tmp_path)
+
+    import chumoli.core.pipeline_runner as pr
+
+    result = run_pipeline_by_name("rec_drop_real", store=store)
+    assert result.success is True
+    assert "events" in result.row_counts
+
+    out = pr.drop_resource("rec_drop_real", "events", store=store)
+    assert out["status"] == "ok", out
+    assert "events" in out["detail"]
