@@ -4,6 +4,9 @@
 
 ## Latest (recovery hardening)
 
+- **`drop-resource` was completely broken** — the dlt CLI got `--pipelines-dir`
+  after the subcommand (rejected) and no `-y` (could hang). Fixed to
+  `dlt -y pipeline --pipelines-dir <dir> <name> drop <resource>`.
 - Recovery (`sync` / `drop-pending` / `drop-resource`) is **blocked while the pipeline
   is running** — wiping pending dirs or dropping a table mid-load corrupts dlt state.
 - Recovery error messages are **redacted** (`sanitize_error`) — no connection-string

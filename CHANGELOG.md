@@ -12,6 +12,10 @@
   (`friendly_error`) so stored/displayed errors never leak passwords or tokens.
 
 ### Fixed
+- `drop-resource` recovery was completely broken: the dlt CLI was invoked with
+  `--pipelines-dir` *after* the subcommand (rejected as "unrecognized arguments")
+  and without `-y` (could hang on the interactive confirmation). Now uses
+  `dlt -y pipeline --pipelines-dir <dir> <name> drop <resource>`.
 - Dashboard run stats: load-OK but quality-fail runs no longer counted as
   "Muvaffaqiyatli"; new `quality_warn` field so "Quality ogohlantirish" card is accurate
 - Run history now shows the failure reason (redacted) instead of only a red badge
