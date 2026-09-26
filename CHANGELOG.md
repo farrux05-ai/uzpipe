@@ -11,6 +11,12 @@
 - `core/errors.py`: credential redaction (`sanitize_error`) and friendly mapping
   (`friendly_error`) so stored/displayed errors never leak passwords or tokens.
 
+### Changed
+- ClickHouse loads now use `parquet` instead of dlt's `jsonl` default (columnar +
+  compressed; much faster for anything but a handful of rows).
+- Quality checks reuse a single `sql_client` instead of opening one per check —
+  avoids a connect/auth round-trip per check on remote destinations.
+
 ### Fixed
 - `drop-resource` recovery was completely broken: the dlt CLI was invoked with
   `--pipelines-dir` *after* the subcommand (rejected as "unrecognized arguments")

@@ -2,7 +2,19 @@
 
 **Verified:** 2026-09-26
 
-## Latest (recovery hardening)
+## Latest (ClickHouse / load performance)
+
+- **ClickHouse loader format:** `parquet` instead of dlt's `jsonl` default
+  (columnar + compressed; `clickhouse_connect.insert_file` is far faster).
+  Override per pipeline via `destination.file_format`.
+- **Quality checks reuse one `sql_client`** instead of opening one per check —
+  removes a connect/auth round-trip per check on remote destinations.
+- Note: a run's wall time is dominated by source/destination network latency, not
+  row count — a 8-row run and a 740-row run both took ~18s in the same environment.
+  For large ClickHouse loads, configure a **staging** destination (S3) so ClickHouse
+  reads via `INSERT INTO … SELECT FROM s3(...)` instead of a local file upload.
+
+## Prior (recovery hardening)
 
 - **`drop-resource` was completely broken** — the dlt CLI got `--pipelines-dir`
   after the subcommand (rejected) and no `-y` (could hang). Fixed to
