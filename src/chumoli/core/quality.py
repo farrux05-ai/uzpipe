@@ -144,77 +144,101 @@ def run_quality_checks(
     report = QualityReport()
     dest = _destination_name(pipeline)
 
-    if quality.row_count_min is not None:
-        for table in target_tables:
-            report.outcomes.append(
-                _run_check_safely(
-                    "row_count",
-                    table,
-                    _check_row_count,
-                    pipeline,
-                    table,
-                    quality.row_count_min,
-                    dest,
-                )
+    # One connection for every check. Opening a sql_client per check is a full
+    # connect/auth round-trip, which dominates on remote destinations.
+    try:
+        client_cm = pipeline.sql_client()
+    except Exception as e:
+        report.outcomes.append(
+            CheckOutcome(
+                check_name="connection",
+                table_name="",
+                passed=False,
+                detail=f"Destinationga ulanib bo'lmadi — {e}",
             )
+        )
+        return report
 
-    if quality.not_null_columns:
-        for table in target_tables:
-            for column in quality.not_null_columns:
+    with client_cm as client:
+        if quality.row_count_min is not None:
+            for table in target_tables:
+                physical = _physical_table(pipeline, table, dest)
                 report.outcomes.append(
                     _run_check_safely(
-                        "not_null",
-                        f"{table}.{column}",
-                        _check_not_null,
-                        pipeline,
+                        "row_count",
                         table,
-                        column,
+                        _check_row_count,
+                        client,
+                        physical,
+                        table,
+                        quality.row_count_min,
                         dest,
                     )
                 )
 
-    if quality.no_duplicates_key:
-        for table in target_tables:
-            # append mode: each run re-inserts keys → aggregate looks duplicated
-            if (write_disposition or "").lower() == "append":
+        if quality.not_null_columns:
+            for table in target_tables:
+                physical = _physical_table(pipeline, table, dest)
+                for column in quality.not_null_columns:
+                    report.outcomes.append(
+                        _run_check_safely(
+                            "not_null",
+                            f"{table}.{column}",
+                            _check_not_null,
+                            client,
+                            physical,
+                            table,
+                            column,
+                            dest,
+                        )
+                    )
+
+        if quality.no_duplicates_key:
+            for table in target_tables:
+                # append mode: each run re-inserts keys → aggregate looks duplicated
+                if (write_disposition or "").lower() == "append":
+                    report.outcomes.append(
+                        CheckOutcome(
+                            check_name="no_duplicates",
+                            table_name=f"{table}.{quality.no_duplicates_key}",
+                            passed=True,
+                            detail=(
+                                f"{table}: append mode — takrorlanish tekshirilmadi "
+                                "(kutilgan holat)"
+                            ),
+                        )
+                    )
+                    continue
+                physical = _physical_table(pipeline, table, dest)
                 report.outcomes.append(
-                    CheckOutcome(
-                        check_name="no_duplicates",
-                        table_name=f"{table}.{quality.no_duplicates_key}",
-                        passed=True,
-                        detail=(
-                            f"{table}: append mode — takrorlanish tekshirilmadi "
-                            "(kutilgan holat)"
-                        ),
+                    _run_check_safely(
+                        "no_duplicates",
+                        f"{table}.{quality.no_duplicates_key}",
+                        _check_no_duplicates,
+                        client,
+                        physical,
+                        table,
+                        quality.no_duplicates_key,
+                        dest,
                     )
                 )
-                continue
-            report.outcomes.append(
-                _run_check_safely(
-                    "no_duplicates",
-                    f"{table}.{quality.no_duplicates_key}",
-                    _check_no_duplicates,
-                    pipeline,
-                    table,
-                    quality.no_duplicates_key,
-                    dest,
-                )
-            )
 
-    if quality.freshness_max_minutes is not None and quality.freshness_column:
-        for table in target_tables:
-            report.outcomes.append(
-                _run_check_safely(
-                    "freshness",
-                    table,
-                    _check_freshness,
-                    pipeline,
-                    table,
-                    quality.freshness_column,
-                    quality.freshness_max_minutes,
-                    dest,
+        if quality.freshness_max_minutes is not None and quality.freshness_column:
+            for table in target_tables:
+                physical = _physical_table(pipeline, table, dest)
+                report.outcomes.append(
+                    _run_check_safely(
+                        "freshness",
+                        table,
+                        _check_freshness,
+                        client,
+                        physical,
+                        table,
+                        quality.freshness_column,
+                        quality.freshness_max_minutes,
+                        dest,
+                    )
                 )
-            )
 
     return report
 
@@ -290,10 +314,9 @@ def freshness_age_sql(table: str, timestamp_column: str, dest: str = "") -> str:
 
 
 def _check_row_count(
-    pipeline: dlt.Pipeline, table: str, minimum: int, dest: str = ""
+    client: Any, physical: str, table: str, minimum: int, dest: str = ""
 ) -> CheckOutcome:
-    physical = _physical_table(pipeline, table, dest)
-    count = _scalar(pipeline, f"SELECT COUNT(*) FROM {_quote(physical, dest)}")
+    count = _scalar(client, f"SELECT COUNT(*) FROM {_quote(physical, dest)}")
     passed = count >= minimum
     detail = (
         f"{table}: {count} qator (kamida {minimum} kutilgan)"
@@ -313,11 +336,10 @@ def _check_row_count(
 
 
 def _check_not_null(
-    pipeline: dlt.Pipeline, table: str, column: str, dest: str = ""
+    client: Any, physical: str, table: str, column: str, dest: str = ""
 ) -> CheckOutcome:
-    physical = _physical_table(pipeline, table, dest)
     null_count = _scalar(
-        pipeline,
+        client,
         f"SELECT COUNT(*) FROM {_quote(physical, dest)} WHERE {_quote(column, dest)} IS NULL",
     )
     passed = null_count == 0
@@ -332,11 +354,10 @@ def _check_not_null(
 
 
 def _check_no_duplicates(
-    pipeline: dlt.Pipeline, table: str, key_column: str, dest: str = ""
+    client: Any, physical: str, table: str, key_column: str, dest: str = ""
 ) -> CheckOutcome:
-    physical = _physical_table(pipeline, table, dest)
     duplicate_count = _scalar(
-        pipeline,
+        client,
         f"""
         SELECT COUNT(*) FROM (
             SELECT {_quote(key_column, dest)}
@@ -358,14 +379,14 @@ def _check_no_duplicates(
 
 
 def _check_freshness(
-    pipeline: dlt.Pipeline,
+    client: Any,
+    physical: str,
     table: str,
     timestamp_column: str,
     max_minutes: int,
     dest: str = "",
 ) -> CheckOutcome:
-    physical = _physical_table(pipeline, table, dest)
-    age_minutes = _scalar(pipeline, freshness_age_sql(physical, timestamp_column, dest))
+    age_minutes = _scalar(client, freshness_age_sql(physical, timestamp_column, dest))
     if age_minutes is None:
         return CheckOutcome(
             check_name="freshness",
@@ -382,8 +403,8 @@ def _check_freshness(
     return CheckOutcome(check_name="freshness", table_name=table, passed=passed, detail=detail)
 
 
-def _scalar(pipeline: dlt.Pipeline, sql: str) -> Any:
-    """Runs a single-value SELECT and returns the scalar, via dlt's own sql_client.
+def _scalar(client: Any, sql: str) -> Any:
+    """Runs a single-value SELECT via an already-open dlt sql_client.
 
     dlt's `execute_query` is the documented, destination-agnostic way
     to run arbitrary SQL against whatever the pipeline's destination
@@ -392,8 +413,11 @@ def _scalar(pipeline: dlt.Pipeline, sql: str) -> Any:
     destination-specific client libraries (e.g. duckdb.connect
     directly), so this module works unchanged regardless of which
     destination a pipeline uses.
+
+    The caller passes one shared client for all checks — opening a
+    sql_client per check is a full connect/auth round-trip, which
+    dominates on remote destinations such as ClickHouse.
     """
-    with pipeline.sql_client() as client:
-        with client.execute_query(sql) as cursor:
-            row = cursor.fetchone()
-            return row[0] if row else None
+    with client.execute_query(sql) as cursor:
+        row = cursor.fetchone()
+        return row[0] if row else None
