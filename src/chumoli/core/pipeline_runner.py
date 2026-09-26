@@ -7,6 +7,7 @@ import threading
 import time
 import tracemalloc
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 
@@ -15,6 +16,8 @@ import structlog
 
 from chumoli.connectors.base import BaseUZConnector, registry
 from chumoli.core.config import PipelineConfig
+from chumoli.core.errors import sanitize_error
+from chumoli.core.identifiers import physical_table_name, quote_identifier
 from chumoli.core.quality import QualityReport, run_quality_checks
 from chumoli.core.row_counts import get_row_counts
 from chumoli.store.control_store import ControlStore, StoredPipeline
@@ -45,6 +48,9 @@ class RunResult:
     schema_changes: list[str] = field(default_factory=list)
     cursor_last_value: Any = None
     is_first_run: bool = True
+    # Human-readable reason when the load itself failed (dlt failed jobs).
+    # Exceptions raised before a RunResult exists are recorded separately.
+    error: str | None = None
 
     @property
     def success(self) -> bool:
@@ -360,6 +366,7 @@ def run_pipeline_by_name(name: str, store: ControlStore | None = None) -> RunRes
                     {"passed": o.passed, "detail": o.detail}
                     for o in result.quality_report.outcomes
                 ],
+                error=result.error,
                 duration_seconds=result.duration_seconds,
             )
         except Exception:
@@ -369,6 +376,71 @@ def run_pipeline_by_name(name: str, store: ControlStore | None = None) -> RunRes
         with _RUNNING_LOCK:
             _RUNNING_PIPELINES.pop(name, None)
         structlog.contextvars.clear_contextvars()
+
+
+def record_run_result(
+    runs: Any,
+    result: RunResult,
+    *,
+    trigger: str,
+    started_at: datetime | None = None,
+) -> None:
+    """Persist a completed run (load OK or dlt failed-jobs) to run history.
+
+    Best-effort: a history write must never fail the run itself.
+    """
+    details = [
+        {"passed": o.passed, "detail": o.detail} for o in result.quality_report.outcomes
+    ]
+    try:
+        runs.record(
+            pipeline_name=result.pipeline_name,
+            success=result.success,
+            quality_passed=result.quality_report.all_passed,
+            row_counts=result.row_counts,
+            quality_details=details,
+            error=sanitize_error(result.error) if result.error else None,
+            trigger=trigger,
+            started_at=started_at,
+            duration_seconds=result.duration_seconds,
+            total_rows=result.total_rows,
+            rows_per_second=result.rows_per_second,
+            new_rows=result.new_rows,
+            col_counts=result.col_counts,
+            schema_changes=result.schema_changes,
+            cursor_last_value=result.cursor_last_value,
+            is_first_run=result.is_first_run,
+            peak_memory_mb=result.peak_memory_mb,
+        )
+    except Exception:
+        log.exception("run_record_failed", pipeline=result.pipeline_name, trigger=trigger)
+
+
+def record_run_failure(
+    runs: Any,
+    pipeline_name: str,
+    error: BaseException | str,
+    *,
+    trigger: str,
+    started_at: datetime | None = None,
+) -> None:
+    """Persist a run that raised before producing a RunResult.
+
+    This is what makes a failed manual/async run visible in the dashboard
+    instead of only a transient toast. Best-effort.
+    """
+    try:
+        runs.record(
+            pipeline_name=pipeline_name,
+            success=False,
+            quality_passed=False,
+            error=sanitize_error(error),
+            trigger=trigger,
+            started_at=started_at,
+            finished_at=datetime.now(UTC),
+        )
+    except Exception:
+        log.exception("run_record_failed", pipeline=pipeline_name, trigger=trigger)
 
 
 def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
@@ -433,6 +505,9 @@ def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
     )
 
     load_succeeded = not load_info.has_failed_jobs
+    load_error: str | None = None
+    if not load_succeeded:
+        load_error = _summarize_failed_jobs(pipeline)
     _set_run_step(name, "count" if load_succeeded else "failed")
     row_counts = (
         get_row_counts(
@@ -448,12 +523,13 @@ def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
 
     if load_succeeded and dest.connector == "filesystem":
         # Publish data-only tables to user-visible folder (no _dlt_* metadata)
+        from pathlib import Path
+
         from chumoli.core.paths import (
             fs_staging_dir,
             publish_filesystem_export,
             resolve_filesystem_url,
         )
-        from pathlib import Path
 
         try:
             staging_root = fs_staging_dir(name)
@@ -521,6 +597,7 @@ def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
         schema_changes=list(dlt_metrics.get("schema_changes") or []),
         cursor_last_value=dlt_metrics.get("cursor_last_value"),
         is_first_run=bool(dlt_metrics.get("is_first_run", True)),
+        error=load_error,
     )
 
 
@@ -573,15 +650,13 @@ def _uz_step_fail_detail(step_name: str, exception_text: str) -> str:
     return f"{label} bosqichida xato: {preferred}"
 
 
-def get_failed_jobs(name: str, store: ControlStore | None = None) -> list[dict[str, str]]:
-    """Faqat haqiqiy muvaffaqiyatsizliklarni qaytaradi (o'zbekcha detail).
+def _failed_jobs_from_pipeline(pipeline: Any) -> list[dict[str, str]]:
+    """Real failed steps/jobs from the last trace (no placeholder).
 
     dlt 1.30: PipelineTrace.steps[*].step_exception faqat step yiqilganda
     to'ldiriladi. Muvaffaqiyatli run'da step_exception=None — ular bu yerga
     kirmaydi. "Oxirgi ish kuzatuvi mavjud" kabi mazmunsiz qator yozilmaydi.
     """
-    _, stored = _load_stored(name, store)
-    pipeline = build_dlt_pipeline(stored.config)
     out: list[dict[str, str]] = []
     try:
         last = pipeline.last_trace
@@ -627,7 +702,24 @@ def get_failed_jobs(name: str, store: ControlStore | None = None) -> list[dict[s
     except Exception as e:
         log.warning("get_failed_jobs_error", error=str(e))
         out.append({"job": "error", "detail": f"Failed jobs o'qib bo'lmadi: {e}"})
+    return out
 
+
+def _summarize_failed_jobs(pipeline: Any) -> str:
+    """One-line, secret-free reason for a failed load (stored in run history)."""
+    jobs = _failed_jobs_from_pipeline(pipeline)
+    details = [j["detail"] for j in jobs if j.get("job") not in ("none", "error")]
+    if not details:
+        details = [j["detail"] for j in jobs]
+    text = "; ".join(details) if details else "Load muvaffaqiyatsiz (sabab aniqlanmadi)"
+    return sanitize_error(text, max_len=1000)
+
+
+def get_failed_jobs(name: str, store: ControlStore | None = None) -> list[dict[str, str]]:
+    """Faqat haqiqiy muvaffaqiyatsizliklarni qaytaradi (o'zbekcha detail)."""
+    _, stored = _load_stored(name, store)
+    pipeline = build_dlt_pipeline(stored.config)
+    out = _failed_jobs_from_pipeline(pipeline)
     if not out:
         out.append(
             {
@@ -726,40 +818,74 @@ def _clear_pending_packages(
         log.exception("pending_aggressive_clear_failed", reason=reason)
 
 
+def _recovery_blocked_if_running(name: str) -> dict[str, str] | None:
+    """Recovery must never run while the pipeline is loading.
+
+    Wiping pending dirs or dropping a table mid-load corrupts dlt state.
+    Returns an error payload to hand back to the caller, or None if safe.
+    """
+    if name in get_running_pipelines():
+        return {
+            "status": "error",
+            "detail": (
+                f"Pipeline '{name}' hozir ishlamoqda — tiklash uchun tugashini kuting."
+            ),
+        }
+    return None
+
+
 def drop_pending_packages(name: str, store: ControlStore | None = None) -> dict[str, str]:
     _, stored = _load_stored(name, store)
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
     pipeline = build_dlt_pipeline(stored.config)
     try:
         _clear_pending_packages(pipeline, name, reason="api", aggressive=True)
+        log.info("recover_drop_pending", pipeline=name)
         return {"status": "ok", "detail": "Pending paketlar o'chirildi"}
     except Exception as e:
-        return {"status": "error", "detail": f"Pending paketlar o'chirilmadi: {e}"}
+        log.exception("recover_drop_pending_failed", pipeline=name)
+        return {
+            "status": "error",
+            "detail": sanitize_error(f"Pending paketlar o'chirilmadi: {e}"),
+        }
 
 
 def sync_from_destination(name: str, store: ControlStore | None = None) -> dict[str, str]:
     _, stored = _load_stored(name, store)
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
     pipeline = build_dlt_pipeline(stored.config)
     try:
         pipeline.sync_destination()
+        log.info("recover_sync", pipeline=name)
         return {"status": "ok", "detail": "Destination bilan sinxronlashtirildi"}
     except Exception as e:
-        return {"status": "error", "detail": f"Sinxronlash xatosi: {e}"}
+        log.exception("recover_sync_failed", pipeline=name)
+        return {
+            "status": "error",
+            "detail": sanitize_error(f"Sinxronlash xatosi: {e}"),
+        }
 
 
-def _preview_fqn(dest_key: str, dataset: str, table_name: str) -> str:
-    """Physical SQL table identifier, dialect-aware.
+def _preview_fqn(
+    dest_key: str, dataset: str, table_name: str, pipeline: Any = None
+) -> str:
+    """Physical, quoted SQL table identifier for preview.
 
     ClickHouse has no real schemas: dlt stores tables as
-    ``{dataset}___{table}`` (default separator). Postgres/DuckDB use
-    schema-qualified ``"dataset"."table"``.
+    ``{dataset}___{table}``. Postgres/DuckDB use schema-qualified
+    ``"dataset"."table"``.
     """
+    if dest_key == "clickhouse":
+        physical = physical_table_name(
+            pipeline, table_name, dest_key=dest_key, dataset=dataset
+        )
+        return quote_identifier(physical, dest_key)
     ds = str(dataset).replace("`", "").replace('"', "").strip() or "raw"
     tbl = str(table_name).replace("`", "").replace('"', "").strip()
-    if dest_key == "clickhouse":
-        # Already prefixed (e.g. from a previous run / system table)
-        if "___" in tbl or "." in tbl:
-            return f"`{tbl}`"
-        return f"`{ds}___{tbl}`"
     return f'"{ds}"."{tbl}"'
 
 
@@ -908,7 +1034,7 @@ def get_preview_rows(
         with pipeline.sql_client() as client:
             for table_name in user_tables[:3]:
                 try:
-                    fqn = _preview_fqn(dest_key, dataset, table_name)
+                    fqn = _preview_fqn(dest_key, dataset, table_name, pipeline)
                     # LIMIT is an int we control (not user SQL) — portable across destinations
                     with client.execute_query(
                         f"SELECT * FROM {fqn} LIMIT {int(limit)}"
@@ -934,34 +1060,46 @@ def drop_resource(name: str, resource: str, store: ControlStore | None = None) -
     import sys
 
     _, stored = _load_stored(name, store)
-    pipeline = build_dlt_pipeline(stored.config)
     res = (resource or "").strip()
     if not res:
         return {"status": "error", "detail": "Resource nomi bo'sh"}
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
+    pipeline = build_dlt_pipeline(stored.config)
     try:
+        # NOTE: `--pipelines-dir` is an option of the `pipeline` subcommand and
+        # MUST come before the pipeline name; `-y` is a global flag that skips
+        # the interactive "About to drop…" confirmation (otherwise the server
+        # would hang waiting on stdin).
         cmd = [
             sys.executable,
             "-m",
             "dlt",
+            "-y",
             "pipeline",
+            "--pipelines-dir",
+            str(pipeline.pipelines_dir),
             name,
             "drop",
             res,
-            "--pipelines-dir",
-            str(pipeline.pipelines_dir),
         ]
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=60,
+            stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()[:400]
             msg = err or "noma'lum"
-            return {"status": "error", "detail": f"Drop xatosi: {msg}"}
+            log.warning("recover_drop_resource_failed", pipeline=name, resource=res)
+            return {"status": "error", "detail": sanitize_error(f"Drop xatosi: {msg}")}
+        log.info("recover_drop_resource", pipeline=name, resource=res)
         return {"status": "ok", "detail": f"Resource o'chirildi: {res}"}
     except subprocess.TimeoutExpired:
         return {"status": "error", "detail": "Drop timeout (60s)"}
     except Exception as e:
-        return {"status": "error", "detail": f"Drop xatosi: {e}"}
+        log.exception("recover_drop_resource_failed", pipeline=name, resource=res)
+        return {"status": "error", "detail": sanitize_error(f"Drop xatosi: {e}")}
