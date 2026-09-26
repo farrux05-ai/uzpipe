@@ -522,12 +522,13 @@ def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
 
     if load_succeeded and dest.connector == "filesystem":
         # Publish data-only tables to user-visible folder (no _dlt_* metadata)
+        from pathlib import Path
+
         from chumoli.core.paths import (
             fs_staging_dir,
             publish_filesystem_export,
             resolve_filesystem_url,
         )
-        from pathlib import Path
 
         try:
             staging_root = fs_staging_dir(name)
@@ -816,24 +817,56 @@ def _clear_pending_packages(
         log.exception("pending_aggressive_clear_failed", reason=reason)
 
 
+def _recovery_blocked_if_running(name: str) -> dict[str, str] | None:
+    """Recovery must never run while the pipeline is loading.
+
+    Wiping pending dirs or dropping a table mid-load corrupts dlt state.
+    Returns an error payload to hand back to the caller, or None if safe.
+    """
+    if name in get_running_pipelines():
+        return {
+            "status": "error",
+            "detail": (
+                f"Pipeline '{name}' hozir ishlamoqda — tiklash uchun tugashini kuting."
+            ),
+        }
+    return None
+
+
 def drop_pending_packages(name: str, store: ControlStore | None = None) -> dict[str, str]:
     _, stored = _load_stored(name, store)
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
     pipeline = build_dlt_pipeline(stored.config)
     try:
         _clear_pending_packages(pipeline, name, reason="api", aggressive=True)
+        log.info("recover_drop_pending", pipeline=name)
         return {"status": "ok", "detail": "Pending paketlar o'chirildi"}
     except Exception as e:
-        return {"status": "error", "detail": f"Pending paketlar o'chirilmadi: {e}"}
+        log.exception("recover_drop_pending_failed", pipeline=name)
+        return {
+            "status": "error",
+            "detail": sanitize_error(f"Pending paketlar o'chirilmadi: {e}"),
+        }
 
 
 def sync_from_destination(name: str, store: ControlStore | None = None) -> dict[str, str]:
     _, stored = _load_stored(name, store)
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
     pipeline = build_dlt_pipeline(stored.config)
     try:
         pipeline.sync_destination()
+        log.info("recover_sync", pipeline=name)
         return {"status": "ok", "detail": "Destination bilan sinxronlashtirildi"}
     except Exception as e:
-        return {"status": "error", "detail": f"Sinxronlash xatosi: {e}"}
+        log.exception("recover_sync_failed", pipeline=name)
+        return {
+            "status": "error",
+            "detail": sanitize_error(f"Sinxronlash xatosi: {e}"),
+        }
 
 
 def _preview_fqn(dest_key: str, dataset: str, table_name: str) -> str:
@@ -1016,10 +1049,13 @@ def drop_resource(name: str, resource: str, store: ControlStore | None = None) -
     import sys
 
     _, stored = _load_stored(name, store)
-    pipeline = build_dlt_pipeline(stored.config)
     res = (resource or "").strip()
     if not res:
         return {"status": "error", "detail": "Resource nomi bo'sh"}
+    blocked = _recovery_blocked_if_running(name)
+    if blocked:
+        return blocked
+    pipeline = build_dlt_pipeline(stored.config)
     try:
         cmd = [
             sys.executable,
@@ -1041,9 +1077,12 @@ def drop_resource(name: str, resource: str, store: ControlStore | None = None) -
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()[:400]
             msg = err or "noma'lum"
-            return {"status": "error", "detail": f"Drop xatosi: {msg}"}
+            log.warning("recover_drop_resource_failed", pipeline=name, resource=res)
+            return {"status": "error", "detail": sanitize_error(f"Drop xatosi: {msg}")}
+        log.info("recover_drop_resource", pipeline=name, resource=res)
         return {"status": "ok", "detail": f"Resource o'chirildi: {res}"}
     except subprocess.TimeoutExpired:
         return {"status": "error", "detail": "Drop timeout (60s)"}
     except Exception as e:
-        return {"status": "error", "detail": f"Drop xatosi: {e}"}
+        log.exception("recover_drop_resource_failed", pipeline=name, resource=res)
+        return {"status": "error", "detail": sanitize_error(f"Drop xatosi: {e}")}

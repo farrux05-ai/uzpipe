@@ -126,3 +126,105 @@ def test_get_failed_jobs_reports_real_failure_uzbek(tmp_path, monkeypatch) -> No
     assert "chumoli_test_forced_failure" in details or "connection refused" in details
     # eski soxta qator yo'q
     assert "oxirgi ish kuzatuvi mavjud" not in details
+
+
+# ── recovery guards ───────────────────────────────────────────────
+
+
+def _save_simple(store, name: str, tmp_path) -> None:
+    manifest = registry.get_manifest("synthetic_volume")
+    config = PipelineConfig(
+        name=name,
+        connector_key="synthetic_volume",
+        source_params={"row_count": "5", "batch_label": "t"},
+        destination=DestinationConfig(
+            connector="duckdb",
+            connection=str(tmp_path / f"{name}.duckdb"),
+            dataset_name="d",
+        ),
+    )
+    store.save(config, {}, manifest)
+
+
+def test_recovery_blocked_while_running(tmp_path, monkeypatch) -> None:
+    """Tiklash pipeline ishlab turganda bajarilmasin (dlt holati buzilmasin)."""
+    register_builtin_connectors()
+    cipher = CredentialCipher(key_path=tmp_path / "k")
+    store = ControlStore(db_path=tmp_path / "c.db", cipher=cipher)
+    _save_simple(store, "rec_running", tmp_path)
+
+    import chumoli.core.pipeline_runner as pr
+
+    monkeypatch.setattr(pr, "get_running_pipelines", lambda: {"rec_running": {"step": "run"}})
+
+    results = [
+        pr.sync_from_destination("rec_running", store=store),
+        pr.drop_pending_packages("rec_running", store=store),
+        pr.drop_resource("rec_running", "items", store=store),
+    ]
+    for out in results:
+        assert out["status"] == "error"
+        assert "ishlamoqda" in out["detail"]
+
+
+def test_sync_recovery_error_is_sanitized(tmp_path, monkeypatch) -> None:
+    """Recovery xato matni parolni sizib chiqarmasin."""
+    register_builtin_connectors()
+    cipher = CredentialCipher(key_path=tmp_path / "k")
+    store = ControlStore(db_path=tmp_path / "c.db", cipher=cipher)
+    _save_simple(store, "rec_sec", tmp_path)
+
+    import chumoli.core.pipeline_runner as pr
+
+    class _FakePipeline:
+        pipelines_dir = str(tmp_path)
+
+        def sync_destination(self) -> None:
+            raise RuntimeError("sync failed: postgresql://admin:s3cr3t@db/prod")
+
+    monkeypatch.setattr(pr, "build_dlt_pipeline", lambda _cfg: _FakePipeline())
+
+    out = pr.sync_from_destination("rec_sec", store=store)
+    assert out["status"] == "error"
+    assert "s3cr3t" not in out["detail"]
+    assert "postgresql://admin:***@db/prod" in out["detail"]
+
+
+def test_drop_resource_error_is_sanitized(tmp_path, monkeypatch) -> None:
+    register_builtin_connectors()
+    cipher = CredentialCipher(key_path=tmp_path / "k")
+    store = ControlStore(db_path=tmp_path / "c.db", cipher=cipher)
+    _save_simple(store, "rec_drop", tmp_path)
+
+    import subprocess as sp
+
+    import chumoli.core.pipeline_runner as pr
+
+    class _FakePipeline:
+        pipelines_dir = str(tmp_path)
+
+    class _Result:
+        returncode = 1
+        stderr = "drop failed: postgresql://u:pw@h/db"
+        stdout = ""
+
+    monkeypatch.setattr(pr, "build_dlt_pipeline", lambda _cfg: _FakePipeline())
+    monkeypatch.setattr(sp, "run", lambda *_a, **_k: _Result())
+
+    out = pr.drop_resource("rec_drop", "items", store=store)
+    assert out["status"] == "error"
+    assert "pw" not in out["detail"]
+    assert "postgresql://u:***@h/db" in out["detail"]
+
+
+def test_drop_resource_empty_name_rejected(tmp_path) -> None:
+    register_builtin_connectors()
+    cipher = CredentialCipher(key_path=tmp_path / "k")
+    store = ControlStore(db_path=tmp_path / "c.db", cipher=cipher)
+    _save_simple(store, "rec_empty", tmp_path)
+
+    import chumoli.core.pipeline_runner as pr
+
+    out = pr.drop_resource("rec_empty", "   ", store=store)
+    assert out["status"] == "error"
+    assert "bo'sh" in out["detail"]

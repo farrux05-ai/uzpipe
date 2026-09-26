@@ -2242,10 +2242,19 @@ async function doRecover(action,resource){
   if(!confirm(labels[action]||'Davom etilsinmi?')) return;
   let path='/api/pipelines/'+encodeURIComponent(recoverPipeline)+'/recover/'+action;
   if(action==='drop-resource'&&resource) path+='?resource='+encodeURIComponent(resource);
+  const btns=['rc-sync','rc-drop-pending','rc-drop-res'].map(id=>document.getElementById(id)).filter(Boolean);
+  btns.forEach(b=>b.disabled=true);
   try{
     const r=await api(path,{method:'POST'});
-    toast((r?.detail||r?.status||'Bajarildi'),'ok');
+    const ok=r?.status!=='error';
+    toast((r?.detail||r?.status||'Bajarildi'), ok?'ok':'err');
   }catch(e){ toast(e.message,'err'); }
+  finally{
+    btns.forEach(b=>b.disabled=false);
+    const resInput=document.getElementById('rc-resource');
+    const dropBtn=document.getElementById('rc-drop-res');
+    if(dropBtn&&resInput) dropBtn.disabled=!resInput.value.trim();
+  }
 }
 
 loadAll();
