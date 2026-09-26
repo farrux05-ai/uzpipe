@@ -5,6 +5,8 @@ from __future__ import annotations
 import structlog
 from typing import Any
 
+from chumoli.core.identifiers import physical_table_name, quote_identifier
+
 log = structlog.get_logger("chumoli.row_counts")
 
 
@@ -81,7 +83,11 @@ def get_row_counts(
     try:
         with pipeline.sql_client() as client:
             for table_name in user_tables:
-                result = client.execute_sql(f'SELECT COUNT(*) FROM "{table_name}"')
+                physical = physical_table_name(
+                    pipeline, table_name, dest_key=dest_key or ""
+                )
+                fqn = quote_identifier(physical, dest_key or "")
+                result = client.execute_sql(f"SELECT COUNT(*) FROM {fqn}")
                 counts[table_name] = int(result[0][0])
     except Exception:
         log.exception(

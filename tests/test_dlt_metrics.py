@@ -161,6 +161,7 @@ def test_clickhouse_freshness_sql() -> None:
 
 
 def test_clickhouse_preview_fqn() -> None:
-    assert _preview_fqn("clickhouse", "raw", "orders") == "`raw`.`orders`"
+    # ClickHouse has no real schemas — dlt stores tables as dataset___table
+    assert _preview_fqn("clickhouse", "raw", "orders") == "`raw___orders`"
     assert _preview_fqn("duckdb", "raw", "orders") == '"raw"."orders"'
     assert _quote("orders", "clickhouse") == "`orders`"

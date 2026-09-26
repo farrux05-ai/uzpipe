@@ -65,6 +65,7 @@ import dlt
 import structlog
 
 from chumoli.core.config import QualityConfig
+from chumoli.core.identifiers import physical_table_name, quote_identifier
 
 log = structlog.get_logger("chumoli.quality")
 
@@ -224,47 +225,14 @@ def _destination_name(pipeline: dlt.Pipeline) -> str:
     return str(name).lower()
 
 
-def _dataset_name(pipeline: dlt.Pipeline) -> str:
-    """Logical dlt dataset name used when the pipeline was built."""
-    name = getattr(pipeline, "dataset_name", None) or ""
-    return str(name).strip() or "raw"
-
-
-def _clickhouse_separator(pipeline: dlt.Pipeline) -> str:
-    """ClickHouse has no real schemas; dlt prefixes tables as dataset + sep + table.
-
-    Default separator is '___' (see dlt ClickHouseClientConfiguration).
-    """
-    try:
-        dest = getattr(pipeline, "destination", None)
-        client_config = getattr(dest, "config", None) or getattr(dest, "client_config", None)
-        sep = getattr(client_config, "dataset_table_separator", None) if client_config else None
-        if sep:
-            return str(sep)
-    except Exception:
-        pass
-    return "___"
-
-
 def _physical_table(pipeline: dlt.Pipeline, logical_table: str, dest: str = "") -> str:
-    """Map logical resource/table name to the physical SQL identifier.
+    """Map a logical resource/table name to the physical SQL identifier.
 
-    ClickHouse cannot host multiple datasets in one database, so dlt
-    stores tables as ``{dataset}{separator}{table}`` (e.g. ``raw___orders``).
-    Other destinations keep the bare table name (schema is handled by
-    sql_client / search path).
+    Thin wrapper over ``core.identifiers`` — the single source of truth for
+    the ClickHouse ``dataset___table`` rule (shared with row counts and
+    preview).
     """
-    cleaned = str(logical_table).replace("`", "").replace('"', "").strip()
-    if not cleaned:
-        return cleaned
-    if dest == "clickhouse":
-        # Already fully qualified / already prefixed — do not double-prefix
-        if "." in cleaned or "___" in cleaned:
-            return cleaned
-        dataset = _dataset_name(pipeline)
-        sep = _clickhouse_separator(pipeline)
-        return f"{dataset}{sep}{cleaned}"
-    return cleaned
+    return physical_table_name(pipeline, logical_table, dest_key=dest)
 
 
 def _quote(identifier: str, dest: str = "") -> str:
@@ -276,10 +244,7 @@ def _quote(identifier: str, dest: str = "") -> str:
     function is ever fed a value from outside the trusted config
     chain, that call site needs its own validation first.
     """
-    cleaned = str(identifier).replace("`", "").replace('"', "")
-    if dest == "clickhouse":
-        return f"`{cleaned}`"
-    return f'"{cleaned}"'
+    return quote_identifier(identifier, dest)
 
 
 def freshness_age_sql(table: str, timestamp_column: str, dest: str = "") -> str:
