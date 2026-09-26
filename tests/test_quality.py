@@ -181,3 +181,15 @@ def test_freshness_bigint_milliseconds(tmp_path) -> None:
     assert report.outcomes[0].check_name == "freshness"
     assert "tekshirib bo'lmadi" not in report.outcomes[0].detail
 
+
+def test_physical_table_prefixes_for_clickhouse(loaded_pipeline) -> None:
+    """ClickHouse has no schemas — dlt stores tables as dataset___table."""
+    from chumoli.core.quality import _physical_table
+
+    assert _physical_table(loaded_pipeline, "orders", "clickhouse") == "raw___orders"
+    # Already prefixed / qualified — do not double-apply
+    assert _physical_table(loaded_pipeline, "raw___orders", "clickhouse") == "raw___orders"
+    # Other destinations keep the logical name
+    assert _physical_table(loaded_pipeline, "orders", "postgres") == "orders"
+    assert _physical_table(loaded_pipeline, "orders", "duckdb") == "orders"
+
