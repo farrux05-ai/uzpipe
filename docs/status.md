@@ -2,7 +2,16 @@
 
 **Verified:** 2026-09-26
 
-## Latest (run error handling)
+## Latest (recovery hardening)
+
+- Recovery (`sync` / `drop-pending` / `drop-resource`) is **blocked while the pipeline
+  is running** — wiping pending dirs or dropping a table mid-load corrupts dlt state.
+- Recovery error messages are **redacted** (`sanitize_error`) — no connection-string
+  passwords in dashboard toasts.
+- Dashboard recovery buttons disable during the action; failures surface as errors
+  (an error payload was previously toasted as success).
+
+## Prior (run error handling)
 
 - **Failures are persisted** for manual (sync), async and demo runs — previously only
   scheduler runs recorded failures, so a dashboard-triggered failure left no trace.

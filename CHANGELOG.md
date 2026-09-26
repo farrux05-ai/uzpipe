@@ -15,6 +15,12 @@
 - Dashboard run stats: load-OK but quality-fail runs no longer counted as
   "Muvaffaqiyatli"; new `quality_warn` field so "Quality ogohlantirish" card is accurate
 - Run history now shows the failure reason (redacted) instead of only a red badge
+- Recovery (`sync` / `drop-pending` / `drop-resource`) now refuses to run while the
+  pipeline is loading — wiping pending dirs or dropping a table mid-load corrupts
+  dlt state
+- Recovery error messages are redacted (no connection-string passwords in toasts)
+- Dashboard recovery buttons disable during the action and surface failures as
+  errors (an error payload was previously toasted as success)
 
 ## 0.1.0 — 2026-09-23
 
