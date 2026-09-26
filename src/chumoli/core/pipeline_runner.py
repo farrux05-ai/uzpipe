@@ -443,6 +443,23 @@ def record_run_failure(
         log.exception("run_record_failed", pipeline=pipeline_name, trigger=trigger)
 
 
+def loader_file_format(config: PipelineConfig) -> str | None:
+    """Destination-specific loader file format (None = dlt's own default).
+
+    - filesystem / s3: csv (Excel-friendly) unless overridden.
+    - clickhouse: parquet — dlt defaults to jsonl, which it inserts row-by-row
+      via clickhouse_connect.insert_file; parquet is columnar + compressed and
+      inserts far faster for anything but a handful of rows.
+    - everything else: dlt's default.
+    """
+    dest = config.destination
+    if dest.connector in ("filesystem", "s3"):
+        return dest.file_format or "csv"
+    if dest.connector == "clickhouse":
+        return dest.file_format if dest.file_format in ("parquet", "jsonl") else "parquet"
+    return None
+
+
 def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
     name = stored.config.name
     log.info("step_extract_start")
@@ -457,13 +474,13 @@ def _execute(stored: StoredPipeline, connector: BaseUZConnector) -> RunResult:
         "write_disposition": stored.config.write_disposition.value,
         "primary_key": stored.config.primary_key or None,
     }
-    # Filesystem / S3: explicit loader format (csv default for local-friendly exports)
     dest = stored.config.destination
+    fmt = loader_file_format(stored.config)
+    if fmt is not None:
+        run_kwargs["loader_file_format"] = fmt
     if dest.connector in ("filesystem", "s3"):
         import os
 
-        fmt = dest.file_format or "csv"
-        run_kwargs["loader_file_format"] = fmt
         # CSV: uncompressed for Excel; other formats must not inherit this process env
         if fmt == "csv":
             os.environ["NORMALIZE__DATA_WRITER__DISABLE_COMPRESSION"] = "true"

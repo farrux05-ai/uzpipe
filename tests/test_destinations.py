@@ -76,3 +76,32 @@ def test_dlt_dest_alias_postgresql_to_postgres() -> None:
     assert "filesystem" not in _DLT_DEST_ALIASES
     assert _DLT_DEST_ALIASES.get("s3") == "filesystem"
     assert "clickhouse" not in _DLT_DEST_ALIASES
+
+
+def test_loader_file_format_per_destination() -> None:
+    """ClickHouse uses parquet (not dlt's jsonl default); filesystem uses csv."""
+    from chumoli.core.pipeline_runner import loader_file_format
+
+    def cfg(connector: str, file_format: str | None = None) -> PipelineConfig:
+        return PipelineConfig(
+            name="fmt",
+            connector_key="rest_api",
+            source_params={"base_url": "https://x", "endpoint": "/", "auth_type": "none"},
+            destination=DestinationConfig(
+                connector=connector,
+                connection="x",
+                dataset_name="raw",
+                file_format=file_format,
+            ),
+        )
+
+    # ClickHouse: parquet by default; jsonl honoured; csv is invalid → parquet
+    assert loader_file_format(cfg("clickhouse")) == "parquet"
+    assert loader_file_format(cfg("clickhouse", "jsonl")) == "jsonl"
+    assert loader_file_format(cfg("clickhouse", "csv")) == "parquet"
+    # Filesystem / S3: csv by default, overridable
+    assert loader_file_format(cfg("filesystem")) == "csv"
+    assert loader_file_format(cfg("filesystem", "parquet")) == "parquet"
+    # Others: dlt's own default
+    assert loader_file_format(cfg("duckdb")) is None
+    assert loader_file_format(cfg("postgresql")) is None
